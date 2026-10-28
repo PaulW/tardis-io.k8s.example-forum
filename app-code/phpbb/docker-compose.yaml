@@ -1,0 +1,181 @@
+# =====================================================================
+# A local development stack for phpBB.
+#
+# Three services share one image:
+#
+#   phpbb-installer  Runs once to install the forum (schema + admin
+#                    user). Uses the 'installer' build target, which
+#                    keeps the install/ directory.
+#   phpbb            The forum itself. Uses the 'production' build
+#                    target, which removes install/ so the forum
+#                    cannot be reinstalled.
+#   phpbb-cron       The scheduled tasks. Uses the same image, and
+#                    runs the CLI entry point on a schedule.
+#
+# The installer and the forum must not run at the same time. The
+# installer writes to the same database and the same store/ volume.
+#
+# The commands:
+#   docker compose up -d mariadb                          # database only
+#   docker compose --profile install up phpbb-installer   # first install
+#   docker compose up -d phpbb                            # run the forum
+#   docker compose --profile cron up -d phpbb-cron        # scheduled tasks
+# =====================================================================
+
+# The project name.
+#
+# Docker Compose derives the project name from the LEAF directory the
+# file is in, and this file lives in a directory called `phpbb`. That
+# is not unique. Almost every phpBB project on the planet lives in a
+# directory with that name, so every one of them would resolve to the
+# project name `phpbb` and SHARE THIS STACK'S VOLUMES.
+#
+# That is not a theoretical problem. Two stacks on one machine end up
+# with one database, and `docker compose down -v` on one of them
+# deletes the other's data.
+#
+# Naming the project here means the volumes are `example-phpbb_*` and
+# nothing else can touch them. The container names are prefixed for
+# the same reason.
+name: example-phpbb
+
+x-phpbb-environment: &phpbb-environment
+  PHPBB_DB_HOST: mariadb
+  PHPBB_DB_PORT: "3306"
+  PHPBB_DB_NAME: ${PHPBB_DB_NAME:-phpbb}
+  PHPBB_DB_USER: phpbb
+  PHPBB_DB_PASS: ${PHPBB_DB_PASS:-phpbb_secret_password}
+  PHPBB_TABLE_PREFIX: phpbb_
+  PHPBB_ACM_TYPE: ${PHPBB_ACM_TYPE:-file}
+  PHPBB_ENV: ${PHPBB_ENV:-production}
+
+# A YAML sequence cannot be merged with the `<<` key, so the volume
+# list is referenced as a whole.
+x-phpbb-volumes: &phpbb-volumes
+  # 1. User-uploaded post attachments and media
+  - phpbb_files:/var/www/html/files
+  # 2. User-uploaded custom profile avatars
+  - phpbb_avatars:/var/www/html/images/avatars/upload
+  # 3. Database backups, migration logs and extension temp packages
+  - phpbb_store:/var/www/html/store
+  # 4. Extensions. A Docker named volume is seeded from the image on
+  #    first use, so anything baked into ext/ survives.
+  #
+  #    In Kubernetes a PVC starts EMPTY, so this directory must be
+  #    seeded by an init container, or the volume must not be mounted
+  #    at all. The local stack will tell you it works, and the
+  #    cluster will come up with an empty ext/.
+  #
+  #    The volume is seeded ONCE. A rebuilt image with a changed
+  #    extension in it is masked by the volume until it is removed,
+  #    which is `make clean`.
+  - phpbb_ext:/var/www/html/ext
+
+services:
+  mariadb:
+    image: mariadb:11.4
+    # The name is prefixed so this stack cannot clash with another
+    # phpBB stack running on the same machine.
+    container_name: example-phpbb-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-root_secret_password}
+      MARIADB_DATABASE: phpbb
+      MARIADB_USER: phpbb
+      MARIADB_PASSWORD: ${PHPBB_DB_PASS:-phpbb_secret_password}
+    # utf8mb4, so the board handles emoji and international text.
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    # The health check matters. The installer and the forum both wait
+    # for it, and a database that is up but not yet initialised is a
+    # database that accepts connections and then fails every query.
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - phpbb_net
+
+  # -------------------------------------------------------------------
+  # The one-shot installer. Run this ONCE, before the first `phpbb`
+  # start.
+  # -------------------------------------------------------------------
+  phpbb-installer:
+    profiles: ["install"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: installer
+    container_name: example-phpbb-installer
+    user: "1000:1000"
+    # The entrypoint runs the installer and then exits. It must not
+    # start the web server, or the container would run forever and the
+    # install would never be reported as complete.
+    command: ["/usr/local/bin/container-init.sh"]
+    environment:
+      <<: *phpbb-environment
+      # This is what tells the entrypoint to run the installer rather
+      # than the forum.
+      PHPBB_RUN_INSTALLER: "true"
+      PHPBB_INSTALLED: "false"
+      PHPBB_ADMIN_NAME: ${PHPBB_ADMIN_NAME:-admin}
+      PHPBB_ADMIN_EMAIL: ${PHPBB_ADMIN_EMAIL:-admin@example.com}
+      PHPBB_ADMIN_PASSWORD: ${PHPBB_ADMIN_PASSWORD:-ChangeMe123!}
+      PHPBB_BOARD_NAME: ${PHPBB_BOARD_NAME:-My Forum}
+      PHPBB_BOARD_DESCRIPTION: ${PHPBB_BOARD_DESCRIPTION:-A phpBB forum}
+    volumes: *phpbb-volumes
+    networks:
+      - phpbb_net
+
+  # -------------------------------------------------------------------
+  # The forum.
+  # -------------------------------------------------------------------
+  phpbb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: example-phpbb-app
+    restart: unless-stopped
+    # The UID has to match the one the image creates its runtime user
+    # for. Change one and you change the other.
+    user: "1000:1000"
+    ports:
+      - "${PHPBB_HTTP_PORT:-8081}:8080"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      <<: *phpbb-environment
+      # The forum is installed. Without this, phpBB redirects every
+      # request to the installer.
+      PHPBB_INSTALLED: "true"
+    volumes: *phpbb-volumes
+    # The cache is scratch space. Mount it in RAM, like a Kubernetes
+    # emptyDir with medium: Memory. phpBB reads and writes it on
+    # every request.
+    tmpfs:
+      - /var/www/html/cache:uid=1000,gid=1000,mode=0770
+    healthcheck:
+      test: ["CMD", "php", "/var/www/html/healthcheck.php"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - phpbb_net
+
+volumes:
+  mariadb_data:
+  phpbb_files:
+  phpbb_avatars:
+  phpbb_store:
+  phpbb_ext:
+
+networks:
+  phpbb_net:

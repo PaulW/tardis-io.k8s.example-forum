@@ -1,0 +1,391 @@
+domain: example.com
+deployments:
+  web:
+    replicas: 1
+    image:
+      arcBuild: true
+      repository: registry.example.com/forum-web
+      tag: "699a019"
+      pullPolicy: IfNotPresent
+    httpPort: 8080
+    dnsConfig:
+      options:
+        - name: ndots
+          value: "1"
+    resources:
+      cpu:
+        request: 10m
+        limit: 20m
+      mem:
+        request: 32Mi
+        limit: 64Mi
+  # The forum.
+  #
+  # PUBLIC. The forum is at the path `/forum` on `www.example.com`,
+  # and the web deployment serves the rest of the host and redirects
+  # it to the forum with a 301.
+  phpbb:
+    replicas: 1
+    # The board has one MariaDB and one PVC set, so a rolling update
+    # would briefly run two pods against the same database. Recreate
+    # avoids that.
+    strategy:
+      type: Recreate
+    image:
+      arcBuild: true
+      # The ARC build matrix entry is `phpbb`, so the reusable workflow
+      # pushes `registry.example.com/forum:<sha>`.
+      #
+      # The chart's arcBuild path takes the REGISTRY from this value
+      # and rebuilds the image name as <release>-<deployment>, so the
+      # name part here is not used for the image. It IS used by the
+      # ARC workflow's yq writeback, which selects on
+      # `image.repository == <registry>/<app>-<deployment>`, so it
+      # must be the full repository or the writeback matches nothing
+      # and the build fails loudly.
+      repository: registry.example.com/forum
+      tag: "817f00a"
+      pullPolicy: IfNotPresent
+    httpPort: 8080
+    # The phpBB entrypoint renders config.php from the environment, so
+    # the database details are environment variables rather than a
+    # baked-in config.
+    #
+    # The chart's database.mysql block creates the database, the user
+    # and the password secret, and names them
+    # <release>-<deployment>-*, so the names here are not free:
+    #   the database : forum-db
+    #   the user    : forum-user
+    #   the secret  : forum-db-password-secret
+    # The connection is routed through MaxScale, so the host is the
+    # proxy service, not the cluster primary.
+    env:
+      - name: PHPBB_DB_HOST
+        value: the-proxy.database-namespace.svc.cluster.local
+      - name: PHPBB_DB_PORT
+        value: "3306"
+      - name: PHPBB_DB_NAME
+        value: forum-db
+      - name: PHPBB_DB_USER
+        value: forum-user
+      - name: PHPBB_DB_PASS
+        valueFrom:
+          secretKeyRef:
+            name: forum-db-password-secret
+            key: password
+      - name: PHPBB_TABLE_PREFIX
+        value: phpbb_
+      # Keep the database connection open between requests.
+      #
+      # A fresh connection costs 4-20 ms and happens on every request,
+      # because phpBB 3.3.19 hardcodes the persistency flag to false.
+      # The `p:` prefix in the config template turns it on.
+      #
+      # The connection is held by the PHP-FPM worker, not by the
+      # request, so the number of connections is the number of workers
+      # and not the number of requests. The pool is 30 workers, and
+      # the `maxUserConnections` is 40, so the pool fits inside the
+      # limit with room for the cron job.
+      - name: PHPBB_DB_PERSISTENT
+        value: "1"
+      - name: PHPBB_ACM_TYPE
+        value: file
+      - name: PHPBB_ENV
+        value: production
+      # The board is restored from a database dump, not installed, so
+      # phpBB must NOT redirect to the installer.
+      - name: PHPBB_INSTALLED
+        value: "true"
+      # The forum is served from /forum on its host. The nginx
+      # configuration is rendered at start time with this value, so
+      # the same image serves the forum from the root or from a
+      # prefix.
+      #
+      # The prefix has to match the script_path setting in the
+      # database, or the board builds its links with the wrong path.
+      - name: PHPBB_PATH_PREFIX
+        value: /forum
+    database:
+      mysql:
+        enabled: true
+        clusterHost: the-proxy.database-namespace.svc.cluster.local
+        rootSecretName: mariadb-root-secret
+        rootSecretKey: rootPassword
+        name: forum-db
+        # The number of connections the forum's database user may
+        # hold at once.
+        #
+        # The operator's default of 10 is too few for the forum. The
+        # PHP-FPM pool holds 30 workers, the cron job holds 1, and
+        # the operator needs room for its own. With the limit at 10,
+        # a burst of requests was refused with "User ... has
+        # exceeded the 'max_user_connections' resource (current
+        # value: 10)", and the forum answered 503.
+        #
+        # The limit must stay at or above the number of workers that
+        # hold a connection, or the forum fails under load. The
+        # `make verify` suite checks the pool against this number.
+        maxUserConnections: 40
+        auth:
+          type: password
+          user: forum-user
+        # The password is NOT here. It is in the encrypted
+        # deployment/environments/secrets.yaml, which the ArgoCD
+        # application loads AFTER this file, so it overrides the
+        # placeholder. The chart puts it in the secret it creates,
+        # so the app and the database agree.
+        password: PLACEHOLDER
+    # The persistent data. The member avatars are restored into the
+    # avatars volume, so it must not be emptied.
+    #
+    # NOTE: the chart renders EITHER a Deployment OR a CronJob for a
+    # deployment key, never both. The scheduled tasks therefore need
+    # their own key (phpbb-cron, below), which points at the same
+    # image and the same volumes.
+    volumes:
+      files:
+        storageClass: longhorn
+        mountPath: /var/www/html/files
+        resources:
+          longhorn:
+            requests:
+              storage: 1Gi
+      avatars:
+        storageClass: longhorn
+        mountPath: /var/www/html/images/avatars/upload
+        resources:
+          longhorn:
+            requests:
+              storage: 1Gi
+      store:
+        storageClass: longhorn
+        mountPath: /var/www/html/store
+        resources:
+          longhorn:
+            requests:
+              storage: 1Gi
+    # The resources for the forum.
+    #
+    # The CPU limit is the binding constraint on the forum. A forum
+    # request costs about 15 ms of CPU, so 500m of CPU serves about
+    # 33 requests a second. The limit was raised from 500m to 1500m
+    # because the pod was being CPU throttled: the throttling counter
+    # reached 779 periods and 75 seconds of throttled time under a
+    # load test.
+    #
+    # The request is unchanged at 100m. The node has 4 cores and is
+    # at 20%, so the burst capacity is there.
+    #
+    # The memory limit is 512 MB. The container measured 60 MB at
+    # rest, and each PHP-FPM worker holds about 10 MB of private
+    # memory, so 30 workers fit with room to spare.
+    resources:
+      cpu:
+        request: 100m
+        limit: 1500m
+      mem:
+        request: 128Mi
+        limit: 512Mi
+  # phpBB's scheduled tasks.
+  #
+  # The chart renders EITHER a Deployment OR a CronJob for a deployment
+  # key, never both, so the cron needs its own key. It runs the same
+  # image, with the same environment and the same volumes, but as a
+  # one-shot job on a schedule rather than a long-running pod.
+  #
+  # phpBB triggers its housekeeping tasks opportunistically when a
+  # visitor loads a page. That is not reliable for a low-traffic
+  # forum, and the Auto Groups cron task needs to run daily.
+  #
+  # The image is NOT built by the ARC workflow for this key: the
+  # workflow's matrix is [web, phpbb], so this deployment's image is
+  # pinned to the same tag as the phpbb deployment, and the yq
+  # writeback for the `phpbb` key rolls both.
+  phpbb-cron:
+    image:
+      arcBuild: false
+      repository: registry.example.com/forum
+      tag: "817f00a"
+      pullPolicy: IfNotPresent
+    # The command MUST go through the image's own entrypoint.
+    #
+    # A `command:` in the chart OVERRIDES the image's ENTRYPOINT, and
+    # the entrypoint is what renders config.php from the environment.
+    # Without it, config.php stays the empty file from the image and
+    # phpBB fails with "parameter core.table_prefix of type NULL".
+    #
+    # The entrypoint renders the config and then execs the command it
+    # is given, so the cron script goes in as the argument.
+    command:
+      - /usr/local/bin/docker-entrypoint.sh
+      - /bin/sh
+      - /usr/local/bin/phpbb-cron.sh
+    env:
+      - name: PHPBB_DB_HOST
+        value: the-proxy.database-namespace.svc.cluster.local
+      - name: PHPBB_DB_PORT
+        value: "3306"
+      - name: PHPBB_DB_NAME
+        value: forum-db
+      - name: PHPBB_DB_USER
+        value: forum-user
+      - name: PHPBB_DB_PASS
+        valueFrom:
+          secretKeyRef:
+            name: forum-db-password-secret
+            key: password
+      - name: PHPBB_TABLE_PREFIX
+        value: phpbb_
+      - name: PHPBB_ACM_TYPE
+        value: file
+      - name: PHPBB_ENV
+        value: production
+      - name: PHPBB_INSTALLED
+        value: "true"
+    # NO volumes here. The chart creates a PVC per volume entry, so
+    # listing the forum's volumes under the cron would make a second
+    # set of claims. The scheduled tasks do not need the forum's
+    # files: they read and write the database, and the store
+    # directory is only used for backups and migration logs, which
+    # the deployment job handles.
+    cronJob:
+      # Hourly, at 17 past. The minute is not 0, so the job does not
+      # land on the same tick as every other cron in the cluster.
+      schedule: "17 * * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 3
+    resources:
+      cpu:
+        request: 50m
+        limit: 500m
+      mem:
+        request: 128Mi
+        limit: 512Mi
+ingresses:
+  web:
+    enabled: true
+    visibility: public
+    subdomain: www
+    # The forum deployment is an in-cluster K8s Service (`web`),
+    # NOT a legacy bare-metal backend. `routeTarget: internal` makes
+    # the chart's IngressRoute point at the in-cluster `web` Service
+    # instead of looking for a non-existent `<deployment>-legacy`
+    # headless Service. Without this, the chart defaults to `legacy`
+    # and the rendered IngressRoute targets `web-legacy`, which never
+    # exists for an in-cluster deployment -- Traefik then returns
+    # 502/404 before the path-level Middleware gets a chance to fire.
+    # `serviceName: web` matches the in-cluster Service rendered by
+    # the chart for `deployments.web` (the chart's serviceName
+    # validation only checks $ingress.serviceName -- the deployment
+    # httpPort is not consulted, despite what the chart's error
+    # message claims). `servicePort: 80` mirrors httpPort so the
+    # IngressRoute's `services[0].port` is a number, not the
+    # auto-derived `http-web` named port.
+    routeTarget: internal
+    serviceName: web
+    servicePort: 8080
+    redirectFrom:
+      ".":
+        mode: 301
+  # The forum's ingress. PUBLIC.
+  #
+  # The forum is on the same host as the site, at /forum. The `web`
+  # deployment serves the rest of the host and redirects it to the
+  # forum, so a visitor who lands on www.example.com ends up in the
+  # forum.
+  #
+  # The forum is served from /forum on the host. The `path` value
+  # tells the chart to route that path, and the PHPBB_PATH_PREFIX
+  # environment variable tells the image to render its nginx
+  # configuration for the same prefix. The two have to agree, and the
+  # script_path setting in the database has to agree as well, or the
+  # board builds its links with the wrong path.
+  #
+  # The priority is higher than the web route's, because both routes
+  # are on www.example.com and the route with the higher priority takes
+  # the traffic. Without it, the host-only web route would answer
+  # for /forum as well.
+  phpbb:
+    enabled: true
+    visibility: public
+    subdomain: www
+    path: /forum
+    priority: 200
+    routeTarget: internal
+    serviceName: phpbb
+    servicePort: 8080
+    # The host already has a DNS record, from the web ingress. The
+    # DNS endpoint is named after the host, so a second one for the
+    # same host would have the same name and the two would collide.
+    dnsEndpoint:
+      enabled: false
+networkPolicies:
+  web:
+    enabled: true
+    # Static page server - no egress needed. Ingress is auto-allowed from
+    # the public Traefik controller (ingresses.web.visibility=public) on
+    # httpPort 80. The chart auto-renders the default DNS egress rule
+    # (harmless; nginx does not resolve). All other egress is denied.
+    # See the security posture notes.
+  phpbb:
+    enabled: true
+    # The forum. Ingress is auto-allowed from the in-cluster Traefik
+    # controller (ingresses.phpbb.visibility=internal).
+    #
+    # Egress: the chart auto-renders DNS and the MariaDB rule
+    # (deployments.phpbb.database.mysql.enabled is true), so the forum
+    # can reach its database. Everything else is denied, including
+    # outbound mail, until the SMTP settings are pointed at the
+    # cluster relay and the rule below is added.
+    egress:
+      # The cluster-mail SMTP relay. phpBB reads its own SMTP settings
+      # from the database (phpbb_config), not from the environment, so
+      # the config is set separately (see RESTORE.md in the deployment
+      # bundle). This rule only opens the network path to the relay.
+      - name: allow-cluster-mail
+        target:
+          type: cluster
+          namespace: cluster-mail
+        ports:
+          - protocol: TCP
+            port: 587
+          - protocol: TCP
+            port: 465
+      # The public internet, for the version check.
+      #
+      # The ACP checks whether the board is on the latest phpBB
+      # release, and it does that on EVERY page load, with a 30
+      # second timeout. It is not cached when it fails, so with the
+      # egress blocked every ACP page waited for two timeouts, which
+      # is about two minutes.
+      #
+      # The check is worth keeping. It is how the administrator finds
+      # out about a security update, and the board is a public forum
+      # when it goes live.
+      #
+      # The private ranges are excluded, so the rule does not open a
+      # path to the rest of the cluster network. This is the same
+      # shape the other services use.
+      # The cluster has no IPv6, so the IPv6 block is left out. It
+      # has no exceptions, so it would also cover the private ranges
+      # over IPv6, and it has no use on a cluster with no IPv6.
+      - name: allow-version-check
+        target:
+          type: internet
+          excludeCidrs:
+            - 10.0.0.0/8
+            - 172.16.0.0/12
+            - 192.168.0.0/16
+          includeIPv6: false
+        ports:
+          - protocol: TCP
+            port: 443
+          # The version check fetches over plain HTTP, because the
+          # phpBB version helper has use_ssl off by default. It
+          # fetches from version.phpbb.com on port 80, and from
+          # www.phpbb.com for an extension. Without port 80 the
+          # fetch times out, and the ACP says it could not get the
+          # version information.
+          - protocol: TCP
+            port: 80

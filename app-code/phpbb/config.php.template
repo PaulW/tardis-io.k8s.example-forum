@@ -1,0 +1,103 @@
+<?php
+/**
+ * phpBB 3.3.x configuration.
+ *
+ * The entrypoint copies this file to `config.php` at container start.
+ * Every value is read from an environment variable at runtime, so the
+ * same image works locally and in a cluster with no rebuild.
+ *
+ * This file is a TEMPLATE, but it is not a text-substitution
+ * template. It is valid PHP as it stands. The entrypoint only has to
+ * make the one decision that cannot be expressed in PHP: whether the
+ * forum is installed.
+ *
+ * Do not edit `config.php` directly. It is overwritten on every
+ * start.
+ *
+ * Do not commit secrets here. In a cluster, the database credentials
+ * are injected from a Kubernetes Secret via `secretKeyRef`.
+ */
+
+// --- Database connection -------------------------------------------------
+//
+// The driver is the fully-qualified class name, not the short 'mysqli'.
+// phpBB 3.1 used the short name, and the conversion to 3.2 and later
+// expects the class.
+$dbms = 'phpbb\\db\\driver\\mysqli';
+$dbhost = getenv('PHPBB_DB_HOST') ?: '127.0.0.1';
+$dbport = getenv('PHPBB_DB_PORT') ?: '3306';
+$dbname = getenv('PHPBB_DB_NAME') ?: 'phpbb';
+$dbuser = getenv('PHPBB_DB_USER') ?: 'phpbb';
+$dbpasswd = getenv('PHPBB_DB_PASS') ?: '';
+$table_prefix = getenv('PHPBB_TABLE_PREFIX') ?: 'phpbb_';
+
+// --- Persistent database connection -------------------------------------
+//
+// A persistent connection keeps the socket open between requests.
+// Without it, every request opens a new connection, and that
+// connection setup is paid on every single request.
+//
+// The `p:` prefix is what tells the mysqli driver to keep the
+// connection open. It is off by default, and turned on with
+// PHPBB_DB_PERSISTENT=1.
+//
+// BEWARE: with persistence on, the PHP-FPM pool holds one connection
+// per worker, so the number of connections is the number of workers,
+// not the number of requests. The pool size has to stay below the
+// database user's connection limit, or the forum answers 503.
+if (getenv('PHPBB_DB_PERSISTENT') === '1') {
+    $dbhost = 'p:' . $dbhost;
+}
+
+// --- Administration panel path -------------------------------------------
+$phpbb_adm_relative_path = 'adm/';
+
+// --- Cache driver --------------------------------------------------------
+//
+// phpBB resolves a bare driver name ('file', 'redis') to
+// `phpbb\cache\driver\<name>`. A fully-qualified class name is used
+// as-is.
+//
+// Use 'redis' when you run more than one replica, so that all the
+// replicas share one cache.
+$acm_type = getenv('PHPBB_ACM_TYPE') ?: 'phpbb\\cache\\driver\\file';
+
+// --- Redis cache connection ---------------------------------------------
+//
+// The redis driver reads CONSTANTS, not config.php variables. Define
+// them when the cache driver is redis.
+if ($acm_type === 'phpbb\\cache\\driver\\redis') {
+    define('PHPBB_ACM_REDIS_HOST', getenv('PHPBB_REDIS_HOST') ?: '127.0.0.1');
+    define('PHPBB_ACM_REDIS_PORT', (int) (getenv('PHPBB_REDIS_PORT') ?: 6379));
+    define('PHPBB_ACM_REDIS_PASSWORD', getenv('PHPBB_REDIS_PASS') ?: '');
+    define('PHPBB_ACM_REDIS_DB', (int) (getenv('PHPBB_REDIS_DB') ?: 0));
+}
+
+// --- The path the forum is served from -----------------------------------
+//
+// It has to agree with the `script_path` and `cookie_path` settings in
+// the database, and with the ingress route. A mismatch is silent, so
+// a script should set them and read them back.
+//
+// `force_server_vars` makes phpBB use these values rather than the
+// ones in the request.
+$script_path = getenv('PHPBB_PATH_PREFIX') ?: '';
+$cookie_path = $script_path;
+$force_server_vars = 1;
+
+$server_name = getenv('PHPBB_SERVER_NAME') ?: 'localhost';
+$server_port = (int) (getenv('PHPBB_SERVER_PORT') ?: 8080);
+
+// --- Install state -------------------------------------------------------
+//
+// PHPBB_INSTALLED tells phpBB "do not redirect to the installer".
+//
+// It must NOT be defined while the installer runs, otherwise phpBB
+// redirects every request to the installer instead of running it.
+//
+// The entrypoint rewrites the marker line below when the container
+// starts. Everything else in this file is read from the environment.
+@@PHPBB_INSTALLED_BLOCK@@
+
+// --- Environment ---------------------------------------------------------
+@define('PHPBB_ENVIRONMENT', getenv('PHPBB_ENV') ?: 'production');

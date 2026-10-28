@@ -1,0 +1,3 @@
+# The local state of the example stack.
+.env
+*.local

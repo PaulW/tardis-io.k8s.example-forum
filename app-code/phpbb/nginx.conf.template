@@ -1,0 +1,132 @@
+# =====================================================================
+# nginx configuration for phpBB in a container.
+#
+# This is a TEMPLATE. The entrypoint renders it at container start
+# into /tmp/nginx.conf, because the forum can be served from the root
+# of a host or from a path prefix, and that is only known at run time.
+#
+# The rendered file goes in /tmp because the container runs as a
+# non-root user and cannot write to /etc/nginx. The includes in here
+# have to be ABSOLUTE, because nginx resolves a relative include
+# against the directory of the config file rather than the working
+# directory.
+# =====================================================================
+
+# The container runs as the phpbb user already, so there is no `user`
+# directive. nginx only honours it when the master process runs with
+# super-user privileges, and it warns about it when it does not.
+#
+# The PID file has to be somewhere the non-root user can write to.
+pid /tmp/nginx.pid;
+
+worker_processes auto;
+
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Route all temporary paths to /tmp for non-root execution.
+    client_body_temp_path /tmp/nginx/client_body;
+    proxy_temp_path       /tmp/nginx/proxy;
+    fastcgi_temp_path     /tmp/nginx/fastcgi;
+    uwsgi_temp_path       /tmp/nginx/uwsgi;
+    scgi_temp_path        /tmp/nginx/scgi;
+
+    sendfile on;
+    keepalive_timeout 65;
+
+    # The browser is the only client that benefits from compression,
+    # and the stylesheets and scripts are the bulk of what it
+    # downloads. phpBB compresses the HTML it generates, but not the
+    # static assets, so nginx has to.
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        application/javascript
+        application/json
+        application/xml
+        image/svg+xml;
+
+    # The forum's files do not change while the container runs, so
+    # nginx can hold the metadata rather than stat()ing every file on
+    # every request.
+    open_file_cache max=10000 inactive=60s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 1;
+    open_file_cache_errors on;
+
+    # An absolute redirect is built with the port nginx is listening
+    # on, which is the container's port and not the client's. This
+    # makes the redirects relative, so the browser resolves them
+    # against the URL it asked for.
+    absolute_redirect off;
+
+    server {
+        listen 8080;
+        server_name _;
+        root /var/www/html;
+        index index.php index.html index.htm;
+
+        # The liveness check. nginx answers it itself, so it never
+        # reaches PHP and never touches the database. A database
+        # outage must not cause a restart loop.
+        location = /healthz {
+            access_log off;
+            add_header Content-Type text/plain;
+            return 200 "OK\n";
+        }
+
+        # The readiness check. This one runs through PHP, because the
+        # forum is only ready if it can reach its database. A pod that
+        # cannot should be pulled out of the Service endpoints without
+        # being restarted.
+        location = /readyz {
+            access_log off;
+            include /etc/nginx/fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root/healthcheck.php;
+            fastcgi_param SCRIPT_NAME /healthcheck.php;
+            fastcgi_pass 127.0.0.1:9000;
+        }
+
+        # The sensitive directories. config.php holds the database
+        # credentials, store/ holds backups, files/ holds the
+        # attachments. None of them should ever be served.
+        location ~ ^/(config\.php|common\.php|healthcheck\.php|cache/|files/|images/avatars/upload/|includes/|phpbb/|store/|vendor/) {
+            deny all;
+            return 404;
+        }
+
+        # The installer route. This file is replaced per build target,
+        # so there is only ever one 'location /install/' block.
+        include /etc/nginx/phpbb-install-location.conf;
+
+        location / {
+            try_files $uri $uri/ @rewriteapp;
+        }
+
+        location @rewriteapp {
+            rewrite ^(.*)$ /app.php$1 last;
+        }
+
+        location ~ \.php(/|$) {
+            try_files $uri =404;
+            include /etc/nginx/fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param SCRIPT_NAME $fastcgi_script_name;
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_index index.php;
+        }
+    }
+}
